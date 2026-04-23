@@ -12,13 +12,12 @@ cudaError_t launch_fallback_backend(const Kernel4Problem& p,
         p.hidden_states,
         p.hidden_states_scale,
         p.token_indices,
-        p.expert_token_offsets,
+        p.local_expert_ids,
         p.gemm1_weights,
         p.gemm1_weights_scale,
         workspace.gemm1_output,
         total_tokens,
-        p.seq_len,
-        NUM_LOCAL_EXPERTS
+        p.seq_len
     );
     if (gemm1_only) {
         return cudaSuccess;
@@ -36,6 +35,7 @@ cudaError_t launch_fallback_backend(const Kernel4Problem& p,
     shared_problem.gemm2_weights_scale = p.gemm2_weights_scale;
     shared_problem.expert_token_offsets = p.expert_token_offsets;
     shared_problem.token_indices = p.token_indices;
+    shared_problem.local_expert_ids = p.local_expert_ids;
     shared_problem.token_expert_weights = p.token_expert_weights;
     shared_problem.routed_scaling_factor = p.routed_scaling_factor;
     shared_problem.seq_len = p.seq_len;
@@ -72,7 +72,9 @@ cudaError_t launch_tiled_backend(const Kernel4Problem& p,
             continue;
         }
 
-        const fp8_e4m3* act_e = p.hidden_states + (size_t)begin * HIDDEN_SIZE;
+        // hidden_states stays in original sequence order; token_indices_e
+        // already remaps dispatched rows back to original tokens.
+        const fp8_e4m3* act_e = p.hidden_states;
         const int* token_indices_e = p.token_indices + begin;
         const fp8_e4m3* w_e = p.gemm1_weights +
             (size_t)expert * GEMM1_OUT_SIZE * HIDDEN_SIZE;
@@ -110,6 +112,7 @@ cudaError_t launch_tiled_backend(const Kernel4Problem& p,
     shared_problem.gemm2_weights_scale = p.gemm2_weights_scale;
     shared_problem.expert_token_offsets = p.expert_token_offsets;
     shared_problem.token_indices = p.token_indices;
+    shared_problem.local_expert_ids = p.local_expert_ids;
     shared_problem.token_expert_weights = p.token_expert_weights;
     shared_problem.routed_scaling_factor = p.routed_scaling_factor;
     shared_problem.seq_len = p.seq_len;

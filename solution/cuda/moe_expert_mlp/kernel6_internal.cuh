@@ -65,6 +65,7 @@ struct Gemm2Problem {
     const float*         gemm2_weights_scale;
     const int*           expert_token_offsets;
     const int*           token_indices;
+    const int*           local_expert_ids;
     const float*         token_expert_weights;
     float                routed_scaling_factor;
     int                  seq_len;
@@ -79,14 +80,15 @@ struct Gemm2Workspace {
     size_t  cutlass_workspace_bytes;
 };
 
-__global__ void fp8_gemm2_project_kernel(
+__global__ void fp8_gemm2_project_and_combine_kernel(
     const __nv_bfloat16* __restrict__ inter,
-    const int*           __restrict__ expert_offsets,
+    const int*           __restrict__ local_expert_ids,
+    const int*           __restrict__ token_indices,
+    const float*         __restrict__ routing_w,
     const fp8_e4m3*      __restrict__ W2,
     const float*         __restrict__ W2_scale,
-    float*               __restrict__ projected,
-    int                  total_tokens,
-    int                  num_local_experts);
+    float*               __restrict__ output_accum,
+    int                  total_tokens);
 
 __global__ void combine_projected_kernel(
     const float*   __restrict__ projected,

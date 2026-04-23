@@ -47,6 +47,7 @@ struct Kernel4Problem {
     float                 routed_scaling_factor;  // multiply final weighted sum
     const int*            expert_token_offsets;   // [NUM_LOCAL_EXPERTS + 1], device ptr
     const int*            token_indices;          // [total_dispatched_tokens], device ptr
+    const int*            local_expert_ids;       // [total_dispatched_tokens], device ptr
     const float*          token_expert_weights;   // [total_dispatched_tokens], device ptr
 
     __nv_bfloat16*        output;                 // [seq_len, HIDDEN_SIZE]

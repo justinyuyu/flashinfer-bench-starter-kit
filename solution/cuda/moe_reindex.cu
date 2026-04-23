@@ -7,6 +7,7 @@ __global__ void moe_reindex_kernel(
     const int* __restrict__ token_expert_slots,
     const int* __restrict__ expert_token_offsets,
     int* __restrict__ token_indices,
+    int* __restrict__ local_expert_ids,
     float* __restrict__ merged_token_weights,
     int seq_len,
     int local_expert_offset) {
@@ -24,6 +25,7 @@ __global__ void moe_reindex_kernel(
     int slot = token_expert_slots[linear];
     int dest = expert_token_offsets[local_expert] + slot;
     token_indices[dest] = token;
+    local_expert_ids[dest] = local_expert;
     merged_token_weights[dest] = token_expert_weights[linear];
 }
 
@@ -33,6 +35,7 @@ void launch_moe_reindex(
     const int* token_expert_slots,
     const int* expert_token_offsets,
     int* token_indices,
+    int* local_expert_ids,
     float* merged_token_weights,
     int seq_len,
     int local_expert_offset,
@@ -50,6 +53,7 @@ void launch_moe_reindex(
         token_expert_slots,
         expert_token_offsets,
         token_indices,
+        local_expert_ids,
         merged_token_weights,
         seq_len,
         local_expert_offset);

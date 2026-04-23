@@ -8,14 +8,109 @@
 #include "moe_reindex.cu"
 #include "moe_expert_mlp/kernel4_cuda_kernels.cu"
 #include "moe_expert_mlp/kernel4_backends.cu"
+#include "moe_expert_mlp/kernel4_cutlass.cu"
 #include "moe_expert_mlp/kernel4.cu"
 #include "moe_expert_mlp/kernel6_cuda_kernels.cu"
 #include "moe_expert_mlp/kernel6_backends.cu"
+#include "moe_expert_mlp/kernel6_cutlass.cu"
 #include "moe_expert_mlp/kernel6.cu"
 
+#include <algorithm>
+#include <cstdio>
 
 
+namespace {
 
+struct WorkspaceCache {
+    void* ptr = nullptr;
+    size_t bytes = 0;
+
+    ~WorkspaceCache() {
+        if (ptr) {
+            cudaFree(ptr);
+        }
+    }
+
+    void* reserve(size_t requested_bytes) {
+        if (requested_bytes == 0) {
+            return nullptr;
+        }
+        if (bytes >= requested_bytes && ptr) {
+            return ptr;
+        }
+        if (ptr) {
+            cudaFree(ptr);
+            ptr = nullptr;
+            bytes = 0;
+        }
+        if (cudaMalloc(&ptr, requested_bytes) != cudaSuccess) {
+            ptr = nullptr;
+            bytes = 0;
+            return nullptr;
+        }
+        bytes = requested_bytes;
+        return ptr;
+    }
+};
+
+thread_local WorkspaceCache k4_workspace_cache;
+thread_local WorkspaceCache k6_workspace_cache;
+
+int choose_total_tokens(tvm::ffi::Tensor expert_token_offsets) {
+    int total_tok = 0;
+    cudaMemcpy(&total_tok,
+               static_cast<int*>(expert_token_offsets.data_ptr()) + moe_spec::NUM_LOCAL_EXPERTS,
+               sizeof(int),
+               cudaMemcpyDeviceToHost);
+    return total_tok;
+}
+
+Kernel4Backend choose_kernel4_backend_policy(int seq_len,
+                                             int total_tok,
+                                             bool has_local_expert_ids) {
+    // Small: minimize setup overhead.
+    if (total_tok <= 256 || seq_len <= 32) {
+        return has_local_expert_ids ? Kernel4Backend::Fallback : Kernel4Backend::Tiled;
+    }
+
+    // Promote to CUTLASS earlier for medium/large workloads once the
+    // grouped GEMM setup cost is amortized.
+    if (k4_cutlass_available() && (total_tok >= 768 || seq_len >= 1024)) {
+        return Kernel4Backend::Cutlass;
+    }
+
+    // Medium: hand-written tiled path usually wins over reference/fallback.
+    if (total_tok <= 4096 || seq_len <= 512) {
+        return Kernel4Backend::Tiled;
+    }
+
+    // Large: prefer grouped GEMM when available; otherwise keep the tiled path.
+    if (k4_cutlass_available()) {
+        return Kernel4Backend::Cutlass;
+    }
+    return Kernel4Backend::Tiled;
+}
+
+Kernel6Backend choose_kernel6_backend_policy(int seq_len, int total_tok) {
+    // Small/medium: fused fallback avoids CUTLASS setup overhead.
+    if (total_tok <= 256 || seq_len <= 64) {
+        return Kernel6Backend::Fallback;
+    }
+
+    // Promote to CUTLASS earlier than kernel4 because fallback kernel6 still
+    // carries high memory traffic even at moderate token counts.
+    if (k6_cutlass_available() && (total_tok >= 768 || seq_len >= 1024)) {
+        return Kernel6Backend::Cutlass;
+    }
+
+    // Large: CUTLASS wins when available.
+    if (k6_cutlass_available()) {
+        return Kernel6Backend::Cutlass;
+    }
+    return Kernel6Backend::Fallback;
+}
+
+}  // namespace
 
 namespace ffi = tvm::ffi;
 
@@ -97,6 +192,7 @@ void reindex_ffi_wrapper(ffi::Tensor token_expert_indices,   // [T, TOP_K]
                          ffi::Tensor token_expert_slots,     // [T, TOP_K]
                          ffi::Tensor expert_token_offsets,   // [E_LOCAL + 1]
                          ffi::Tensor token_indices,          // [T * TOP_K] capacity
+                         ffi::Tensor local_expert_ids,       // [T * TOP_K] capacity
                          ffi::Tensor merged_token_weights,   // [T * TOP_K] capacity
                          int seq_len,
                          int local_expert_offset) {
@@ -106,6 +202,7 @@ void reindex_ffi_wrapper(ffi::Tensor token_expert_indices,   // [T, TOP_K]
         static_cast<const int*>(token_expert_slots.data_ptr()),
         static_cast<const int*>(expert_token_offsets.data_ptr()),
         static_cast<int*>(token_indices.data_ptr()),
+        static_cast<int*>(local_expert_ids.data_ptr()),
         static_cast<float*>(merged_token_weights.data_ptr()),
         seq_len,
         local_expert_offset
@@ -127,14 +224,13 @@ void kernel4_ffi_wrapper(ffi::Tensor hidden_states,
                          ffi::Tensor token_expert_weights,
                          ffi::Tensor output,
                          int seq_len, int local_expert_offset, float routed_scaling_factor) {
-                         
-    int total_tok = 0;
-    cudaMemcpy(&total_tok, static_cast<int*>(expert_token_offsets.data_ptr()) + moe_spec::NUM_LOCAL_EXPERTS, sizeof(int), cudaMemcpyDeviceToHost);
+    int total_tok = choose_total_tokens(expert_token_offsets);
 
     size_t workspace_bytes = k4_query_workspace(seq_len, total_tok, 0);
-    void* d_workspace = nullptr;
-    if (workspace_bytes > 0) {
-        cudaMalloc(&d_workspace, workspace_bytes);
+    void* d_workspace = k4_workspace_cache.reserve(workspace_bytes);
+    if (workspace_bytes > 0 && !d_workspace) {
+        fprintf(stderr, "Failed to reserve kernel4 workspace (%zu bytes)\n", workspace_bytes);
+        return;
     }
 
     Kernel4Workspace workspace = k4_bind_workspace(d_workspace, workspace_bytes, seq_len, total_tok, 0);
@@ -153,14 +249,17 @@ void kernel4_ffi_wrapper(ffi::Tensor hidden_states,
     problem.routed_scaling_factor = routed_scaling_factor;
     problem.expert_token_offsets = static_cast<const int*>(expert_token_offsets.data_ptr());
     problem.token_indices = static_cast<const int*>(token_indices.data_ptr());
+    problem.local_expert_ids = nullptr;
     problem.token_expert_weights = static_cast<const float*>(token_expert_weights.data_ptr());
     problem.output = static_cast<__nv_bfloat16*>(output.data_ptr());
-    problem.backend = Kernel4Backend::Auto;
+    problem.backend = choose_kernel4_backend_policy(
+        seq_len,
+        total_tok,
+        /*has_local_expert_ids=*/false
+    );
     problem.stream = nullptr;
 
     k4_launch(problem, workspace);
-
-    if (d_workspace) cudaFree(d_workspace);
 }
 
 static auto _kernel4 = ffi::reflection::GlobalDef().def("kernel4_ffi", kernel4_ffi_wrapper);
@@ -173,16 +272,16 @@ void gemm1_swiglu_ffi_wrapper(ffi::Tensor hidden_states,
                               ffi::Tensor gemm1_weights_scale,
                               ffi::Tensor expert_token_offsets,
                               ffi::Tensor token_indices,
+                              ffi::Tensor local_expert_ids,
                               ffi::Tensor output,
                               int seq_len, int local_expert_offset) {
-                         
-    int total_tok = 0;
-    cudaMemcpy(&total_tok, static_cast<int*>(expert_token_offsets.data_ptr()) + moe_spec::NUM_LOCAL_EXPERTS, sizeof(int), cudaMemcpyDeviceToHost);
+    int total_tok = choose_total_tokens(expert_token_offsets);
 
     size_t workspace_bytes = k4_query_workspace(seq_len, total_tok, 0);
-    void* d_workspace = nullptr;
-    if (workspace_bytes > 0) {
-        cudaMalloc(&d_workspace, workspace_bytes);
+    void* d_workspace = k4_workspace_cache.reserve(workspace_bytes);
+    if (workspace_bytes > 0 && !d_workspace) {
+        fprintf(stderr, "Failed to reserve kernel4 workspace (%zu bytes)\n", workspace_bytes);
+        return;
     }
 
     Kernel4Workspace workspace = k4_bind_workspace(d_workspace, workspace_bytes, seq_len, total_tok, 0);
@@ -196,8 +295,13 @@ void gemm1_swiglu_ffi_wrapper(ffi::Tensor hidden_states,
     problem.local_expert_offset = local_expert_offset;
     problem.expert_token_offsets = static_cast<const int*>(expert_token_offsets.data_ptr());
     problem.token_indices = static_cast<const int*>(token_indices.data_ptr());
+    problem.local_expert_ids = static_cast<const int*>(local_expert_ids.data_ptr());
     problem.output = nullptr; // Not used for gemm1 call
-    problem.backend = Kernel4Backend::Auto;
+    problem.backend = choose_kernel4_backend_policy(
+        seq_len,
+        total_tok,
+        /*has_local_expert_ids=*/true
+    );
     problem.stream = nullptr;
 
     k4_launch_gemm1(problem, workspace);
@@ -206,8 +310,6 @@ void gemm1_swiglu_ffi_wrapper(ffi::Tensor hidden_states,
     cudaMemcpy(output.data_ptr(), workspace.gemm1_output, 
                (size_t)total_tok * moe_spec::INTERMEDIATE_SIZE * sizeof(__nv_bfloat16), 
                cudaMemcpyDeviceToDevice);
-
-    if (d_workspace) cudaFree(d_workspace);
 }
 
 static auto _gemm1_swiglu = ffi::reflection::GlobalDef().def("gemm1_swiglu_ffi", gemm1_swiglu_ffi_wrapper);
@@ -219,17 +321,17 @@ void kernel6_ffi_wrapper(ffi::Tensor hidden_states,
                          ffi::Tensor gemm2_weights_scale,
                          ffi::Tensor expert_token_offsets,
                          ffi::Tensor token_indices,
+                         ffi::Tensor local_expert_ids,
                          ffi::Tensor token_expert_weights,
                          ffi::Tensor output,
                          int seq_len, int local_expert_offset, float routed_scaling_factor) {
-                         
-    int total_tok = 0;
-    cudaMemcpy(&total_tok, static_cast<int*>(expert_token_offsets.data_ptr()) + moe_spec::NUM_LOCAL_EXPERTS, sizeof(int), cudaMemcpyDeviceToHost);
+    int total_tok = choose_total_tokens(expert_token_offsets);
 
     size_t workspace_bytes = k6_query_workspace(seq_len, total_tok, 0);
-    void* d_workspace = nullptr;
-    if (workspace_bytes > 0) {
-        cudaMalloc(&d_workspace, workspace_bytes);
+    void* d_workspace = k6_workspace_cache.reserve(workspace_bytes);
+    if (workspace_bytes > 0 && !d_workspace) {
+        fprintf(stderr, "Failed to reserve kernel6 workspace (%zu bytes)\n", workspace_bytes);
+        return;
     }
 
     Kernel6Workspace workspace = k6_bind_workspace(d_workspace, workspace_bytes, seq_len, total_tok, 0);
@@ -243,14 +345,13 @@ void kernel6_ffi_wrapper(ffi::Tensor hidden_states,
     problem.routed_scaling_factor = routed_scaling_factor;
     problem.expert_token_offsets = static_cast<const int*>(expert_token_offsets.data_ptr());
     problem.token_indices = static_cast<const int*>(token_indices.data_ptr());
+    problem.local_expert_ids = static_cast<const int*>(local_expert_ids.data_ptr());
     problem.token_expert_weights = static_cast<const float*>(token_expert_weights.data_ptr());
     problem.output = static_cast<__nv_bfloat16*>(output.data_ptr());
-    problem.backend = Kernel6Backend::Auto;
+    problem.backend = choose_kernel6_backend_policy(seq_len, total_tok);
     problem.stream = nullptr;
 
     k6_launch(problem, workspace);
-
-    if (d_workspace) cudaFree(d_workspace);
 }
 
 static auto _kernel6 = ffi::reflection::GlobalDef().def("kernel6_ffi", kernel6_ffi_wrapper);

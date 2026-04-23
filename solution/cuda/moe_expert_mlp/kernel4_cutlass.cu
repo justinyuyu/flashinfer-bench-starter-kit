@@ -281,7 +281,8 @@ static cudaError_t run_cutlass_grouped_float_gemm(
 
 cudaError_t launch_cutlass_backend(const Kernel4Problem& p,
                                    const Kernel4Workspace& workspace,
-                                   int total_tokens) {
+                                   int total_tokens,
+                                   bool gemm1_only) {
     if (!workspace.cutlass_workspace) {
         return cudaErrorInvalidValue;
     }
@@ -417,12 +418,17 @@ cudaError_t launch_cutlass_backend(const Kernel4Problem& p,
         }
     }
 
+    if (gemm1_only) {
+        return cudaSuccess;
+    }
+
     kernel6_internal::Gemm2Problem shared_problem{};
     shared_problem.hidden_states = workspace.gemm1_output;
     shared_problem.gemm2_weights = p.gemm2_weights;
     shared_problem.gemm2_weights_scale = p.gemm2_weights_scale;
     shared_problem.expert_token_offsets = p.expert_token_offsets;
     shared_problem.token_indices = p.token_indices;
+    shared_problem.local_expert_ids = p.local_expert_ids;
     shared_problem.token_expert_weights = p.token_expert_weights;
     shared_problem.routed_scaling_factor = p.routed_scaling_factor;
     shared_problem.seq_len = p.seq_len;

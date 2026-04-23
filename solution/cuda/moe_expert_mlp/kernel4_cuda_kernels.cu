@@ -89,13 +89,12 @@ __global__ void fp8_gemm1_swiglu_reference_kernel(
     const fp8_e4m3* __restrict__ act,
     const float*    __restrict__ act_scale,
     const int*      __restrict__ token_indices,
-    const int*      __restrict__ expert_offsets,
+    const int*      __restrict__ local_expert_ids,
     const fp8_e4m3* __restrict__ W,
     const float*    __restrict__ W_scale,
     __nv_bfloat16*  __restrict__ out,
     int             total_tokens,
-    int             seq_len,
-    int             num_local_experts)
+    int             seq_len)
 {
     int tok = blockIdx.x;
     int out_col = threadIdx.x + blockIdx.y * blockDim.x;
@@ -103,13 +102,7 @@ __global__ void fp8_gemm1_swiglu_reference_kernel(
 
     if (tok >= total_tokens || out_col >= INTERMEDIATE_SIZE) return;
 
-    int expert_id = 0;
-    for (int e = 0; e < num_local_experts; ++e) {
-        if (tok >= expert_offsets[e] && tok < expert_offsets[e + 1]) {
-            expert_id = e;
-            break;
-        }
-    }
+    int expert_id = load_cached(local_expert_ids + tok);
 
     int orig_tok = load_cached(token_indices + tok);
     const fp8_e4m3* W_e = W + (size_t)expert_id * GEMM1_OUT_SIZE * HIDDEN_SIZE;

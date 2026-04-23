@@ -103,8 +103,11 @@ cudaError_t k6_launch(const Kernel6Problem& p,
 
     const size_t required_workspace = k6_query_workspace(
         p.seq_len, total_tokens, workspace.cutlass_workspace_bytes);
+    const bool needs_gemm2_output =
+        (p.backend == Kernel6Backend::Cutlass) ||
+        (p.backend == Kernel6Backend::Auto && k6_cutlass_available());
     if (!workspace.storage || workspace.storage_bytes < required_workspace ||
-        !workspace.gemm2_output || !workspace.output_accum) {
+        (needs_gemm2_output && !workspace.gemm2_output) || !workspace.output_accum) {
         return cudaErrorInvalidValue;
     }
 
@@ -118,6 +121,7 @@ cudaError_t k6_launch(const Kernel6Problem& p,
     shared_problem.gemm2_weights_scale = p.gemm2_weights_scale;
     shared_problem.expert_token_offsets = p.expert_token_offsets;
     shared_problem.token_indices = p.token_indices;
+    shared_problem.local_expert_ids = p.local_expert_ids;
     shared_problem.token_expert_weights = p.token_expert_weights;
     shared_problem.routed_scaling_factor = p.routed_scaling_factor;
     shared_problem.seq_len = p.seq_len;

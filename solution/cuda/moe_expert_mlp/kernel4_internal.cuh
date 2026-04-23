@@ -63,13 +63,12 @@ __global__ void fp8_gemm1_swiglu_reference_kernel(
     const fp8_e4m3* __restrict__ act,
     const float*    __restrict__ act_scale,
     const int*      __restrict__ token_indices,
-    const int*      __restrict__ expert_offsets,
+    const int*      __restrict__ local_expert_ids,
     const fp8_e4m3* __restrict__ W,
     const float*    __restrict__ W_scale,
     __nv_bfloat16*  __restrict__ out,
     int             total_tokens,
-    int             seq_len,
-    int             num_local_experts);
+    int             seq_len);
 
 #if defined(K4_ENABLE_CUTLASS)
 __global__ void dequant_activations_kernel(

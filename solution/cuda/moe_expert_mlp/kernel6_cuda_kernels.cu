@@ -2,26 +2,21 @@
 
 namespace kernel6_internal {
 
-__global__ void fp8_gemm2_project_kernel(
+__global__ void fp8_gemm2_project_and_combine_kernel(
     const __nv_bfloat16* __restrict__ inter,
-    const int*           __restrict__ expert_offsets,
+    const int*           __restrict__ local_expert_ids,
+    const int*           __restrict__ token_indices,
+    const float*         __restrict__ routing_w,
     const fp8_e4m3*      __restrict__ W2,
     const float*         __restrict__ W2_scale,
-    float*               __restrict__ projected,
-    int                  total_tokens,
-    int                  num_local_experts)
+    float*               __restrict__ output_accum,
+    int                  total_tokens)
 {
     int tok = blockIdx.x;
     int out_col = threadIdx.x + blockIdx.y * blockDim.x;
     if (tok >= total_tokens || out_col >= HIDDEN_SIZE) return;
 
-    int expert_id = 0;
-    for (int e = 0; e < num_local_experts; ++e) {
-        if (tok >= expert_offsets[e] && tok < expert_offsets[e + 1]) {
-            expert_id = e;
-            break;
-        }
-    }
+    int expert_id = load_cached(local_expert_ids + tok);
 
     const __nv_bfloat16* inter_tok = inter + (size_t)tok * INTERMEDIATE_SIZE;
     const fp8_e4m3* W_e = W2 + (size_t)expert_id * HIDDEN_SIZE * INTERMEDIATE_SIZE;
@@ -42,7 +37,9 @@ __global__ void fp8_gemm2_project_kernel(
     }
 
 
-    projected[(size_t)tok * HIDDEN_SIZE + out_col] = acc;
+    int orig_tok = load_cached(token_indices + tok);
+    float rw = load_cached(routing_w + tok);
+    atomicAdd(output_accum + (size_t)orig_tok * HIDDEN_SIZE + out_col, acc * rw);
 }
 
 __global__ void combine_projected_kernel(
@@ -62,7 +59,6 @@ __global__ void combine_projected_kernel(
     if (orig_tok < 0 || orig_tok >= seq_len) return;
 
     float rw = load_cached(routing_w + tok);
-
     float value = projected[(size_t)tok * HIDDEN_SIZE + out_col];
     atomicAdd(output_accum + (size_t)orig_tok * HIDDEN_SIZE + out_col, value * rw);
 }

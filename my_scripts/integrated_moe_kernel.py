@@ -1,6 +1,30 @@
 import torch
 import tvm_ffi
 
+
+_ROUTER_FUNC = None
+_SCAN_FUNC = None
+_REINDEX_FUNC = None
+_GEMM1_FUNC = None
+_GEMM2_FUNC = None
+
+
+def _get_global_func_cached(name: str):
+    global _ROUTER_FUNC, _SCAN_FUNC, _REINDEX_FUNC, _GEMM1_FUNC, _GEMM2_FUNC
+    cache = {
+        "router_ffi": "_ROUTER_FUNC",
+        "scan_ffi": "_SCAN_FUNC",
+        "reindex_ffi": "_REINDEX_FUNC",
+        "gemm1_swiglu_ffi": "_GEMM1_FUNC",
+        "kernel6_ffi": "_GEMM2_FUNC",
+    }
+    cache_name = cache[name]
+    func = globals()[cache_name]
+    if func is None:
+        func = tvm_ffi.get_global_func(name)
+        globals()[cache_name] = func
+    return func
+
 def get_token_indices(
     token_expert_indices: torch.Tensor,
     token_expert_slots: torch.Tensor,
@@ -102,21 +126,23 @@ def reindex_and_gather_gpu(
     local_expert_offset: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build expert-grouped token ids and routing weights without host copies."""
-    capacity = seq_len * TOP_K
-    token_indices = torch.empty(capacity, dtype=torch.int32, device=token_expert_indices.device)
-    merged_token_weights = torch.empty(capacity, dtype=torch.float32, device=token_expert_indices.device)
+    total_assigned = int(expert_token_offsets[-1].item())
+    token_indices = torch.empty(total_assigned, dtype=torch.int32, device=token_expert_indices.device)
+    local_expert_ids = torch.empty(total_assigned, dtype=torch.int32, device=token_expert_indices.device)
+    merged_token_weights = torch.empty(total_assigned, dtype=torch.float32, device=token_expert_indices.device)
 
-    reindex_func = tvm_ffi.get_global_func("reindex_ffi")
+    reindex_func = _get_global_func_cached("reindex_ffi")
     reindex_func(
         tvm_ffi.from_dlpack(token_expert_indices),
         tvm_ffi.from_dlpack(token_expert_weights),
         tvm_ffi.from_dlpack(token_expert_slots),
         tvm_ffi.from_dlpack(expert_token_offsets),
         tvm_ffi.from_dlpack(token_indices),
+        tvm_ffi.from_dlpack(local_expert_ids),
         tvm_ffi.from_dlpack(merged_token_weights),
         seq_len, local_expert_offset
     )
-    return token_indices, merged_token_weights
+    return token_indices, local_expert_ids, merged_token_weights
 
 def integrated_moe(
     routing_logits: torch.Tensor,
@@ -168,7 +194,7 @@ def integrated_moe(
     token_expert_weights = torch.zeros(seq_len, TOP_K, device=device, dtype=torch.float32)
     token_expert_slots = torch.zeros(seq_len, TOP_K, device=device, dtype=torch.int32)
     
-    router_func = tvm_ffi.get_global_func("router_ffi")
+    router_func = _get_global_func_cached("router_ffi")
     router_func(
         tvm_ffi.from_dlpack(routing_logits.to(torch.float32)),
         tvm_ffi.from_dlpack(routing_bias.to(torch.bfloat16)),
@@ -185,7 +211,7 @@ def integrated_moe(
     expert_token_offsets = torch.zeros(E_LOCAL + 1, device=device, dtype=torch.int32)
     local_counts = expert_token_counts[local_expert_offset : local_expert_offset + E_LOCAL]
     
-    scan_func = tvm_ffi.get_global_func("scan_ffi")
+    scan_func = _get_global_func_cached("scan_ffi")
     scan_func(
         tvm_ffi.from_dlpack(local_counts),
         tvm_ffi.from_dlpack(expert_token_offsets),
@@ -195,7 +221,7 @@ def integrated_moe(
 
     # --- Step 3: PREPARE INDICES ---
     torch.cuda.nvtx.range_push("moe_reindex")
-    token_indices, merged_token_weights = reindex_and_gather_gpu(
+    token_indices, local_expert_ids, merged_token_weights = reindex_and_gather_gpu(
         token_expert_indices, token_expert_weights, token_expert_slots,
         expert_token_offsets, seq_len, TOP_K, local_expert_offset
     )
@@ -204,10 +230,11 @@ def integrated_moe(
     # --- Step 4: KERNEL 4 (GEMM1 + SwiGLU) ---
     torch.cuda.nvtx.range_push("moe_gemm1_swiglu")
     # I = intermediate_size. gemm2_weights shape is [E_LOCAL, H, I]
-    I = gemm2_weights.shape[2] 
-    inter_tokens = torch.empty(seq_len * TOP_K, I, device=device, dtype=torch.bfloat16)
+    I = gemm2_weights.shape[2]
+    total_assigned = int(expert_token_offsets[-1].item())
+    inter_tokens = torch.empty(total_assigned, I, device=device, dtype=torch.bfloat16)
     
-    gemm1_func = tvm_ffi.get_global_func("gemm1_swiglu_ffi")
+    gemm1_func = _get_global_func_cached("gemm1_swiglu_ffi")
     gemm1_func(
         tvm_ffi.from_dlpack(hidden_states),
         tvm_ffi.from_dlpack(hidden_states_scale.to(torch.float32)),
@@ -215,6 +242,7 @@ def integrated_moe(
         tvm_ffi.from_dlpack(gemm1_weights_scale.to(torch.float32)),
         tvm_ffi.from_dlpack(expert_token_offsets),
         tvm_ffi.from_dlpack(token_indices),
+        tvm_ffi.from_dlpack(local_expert_ids),
         tvm_ffi.from_dlpack(inter_tokens),
         seq_len, local_expert_offset
     )
@@ -223,13 +251,14 @@ def integrated_moe(
     # --- Step 5: KERNEL 6 (GEMM2) ---
     torch.cuda.nvtx.range_push("moe_gemm2_acc")
     output = torch.zeros(seq_len, H, device=device, dtype=torch.bfloat16)
-    gemm2_func = tvm_ffi.get_global_func("kernel6_ffi")
+    gemm2_func = _get_global_func_cached("kernel6_ffi")
     gemm2_func(
         tvm_ffi.from_dlpack(inter_tokens),
         tvm_ffi.from_dlpack(gemm2_weights),
         tvm_ffi.from_dlpack(gemm2_weights_scale.to(torch.float32)),
         tvm_ffi.from_dlpack(expert_token_offsets),
         tvm_ffi.from_dlpack(token_indices),
+        tvm_ffi.from_dlpack(local_expert_ids),
         tvm_ffi.from_dlpack(merged_token_weights),
         tvm_ffi.from_dlpack(output),
         seq_len, local_expert_offset, routed_scaling_factor
