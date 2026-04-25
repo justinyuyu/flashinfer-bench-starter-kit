@@ -146,8 +146,15 @@ int choose_total_tokens(tvm::ffi::Tensor expert_token_offsets) {
 Kernel4Backend choose_kernel4_backend_policy(int seq_len,
                                              int total_tok,
                                              bool has_local_expert_ids) {
-    // Very tiny routed batches benefit from the micro-tiled kernel4 path.
-    if (total_tok <= 4) {
+    // Very tiny routed batches: route to Cutlass when available. Cutlass uses
+    // device-side expert offsets so it skips the host-fetch sync entirely, and
+    // the BF16 TensorOp grouped GEMM beats the per-expert tiled loop (which
+    // launches one micro kernel per active expert plus carries 32 iterations
+    // of bookkeeping). When CUTLASS isn't compiled in, fall back to Tiled.
+    if (total_tok >= 1 && total_tok <= 4) {
+        if (k4_cutlass_available()) {
+            return Kernel4Backend::Cutlass;
+        }
         return Kernel4Backend::Tiled;
     }
 
@@ -496,7 +503,9 @@ void integrated_moe_ffi_wrapper(ffi::Tensor routing_logits,
         return;
     }
     FusedMoeTempBuffers buffers = bind_fused_moe_temp(fused_storage, seq_len);
-    cudaMemset(buffers.expert_token_counts, 0, static_cast<size_t>(moe_spec::NUM_EXPERTS) * sizeof(int));
+    // Async zeroing: avoid a host sync that previously dominated tiny-shape latency.
+    cudaMemsetAsync(buffers.expert_token_counts, 0,
+                    static_cast<size_t>(moe_spec::NUM_EXPERTS) * sizeof(int));
 
     router<E_GLOBAL, E_LOCAL, TOP_K><<<blocks, threads>>>(
         static_cast<const float*>(routing_logits.data_ptr()),

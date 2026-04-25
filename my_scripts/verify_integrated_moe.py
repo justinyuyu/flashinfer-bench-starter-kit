@@ -343,7 +343,9 @@ def analyze_dispatch(
 
     # Mirror choose_kernel4_backend_policy() in solution/cuda/moe_ffi.cu.
     # The integrated path always passes has_local_expert_ids=true.
-    if total_tok <= 4:
+    if 1 <= total_tok <= 4:
+        k4_backend = "cutlass" if cutlass_enabled else "tiled"
+    elif total_tok <= 4:
         k4_backend = "tiled"
     elif cutlass_enabled and 18 <= total_tok <= 256:
         k4_backend = "cutlass"
