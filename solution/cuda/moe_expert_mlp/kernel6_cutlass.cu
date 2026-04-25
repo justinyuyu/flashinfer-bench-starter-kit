@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <cutlass/cutlass.h>
+#include <cutlass/bfloat16.h>
 #include <cutlass/gemm/device/default_gemm_configuration.h>
 #include <cutlass/gemm/device/gemm_grouped.h>
 #include <cutlass/gemm/kernel/default_gemm_grouped.h>
@@ -13,29 +14,44 @@
 
 namespace kernel6_internal {
 
-constexpr int kCutlassGroupedBatchExperts = 2;
+// Bump from 2 → NUM_LOCAL_EXPERTS so a typical workload (≤32 active experts)
+// fits in a SINGLE grouped GEMM call.
+constexpr int kCutlassGroupedBatchExperts = NUM_LOCAL_EXPERTS;
+
+// BF16 Tensor-Op grouped GEMM (see kernel4_cutlass.cu for the rationale).
+// hidden_states arrive in __nv_bfloat16 already, so we feed them straight
+// into the GEMM as A without any FP32 conversion - eliminating both the
+// inter_f32 scratch buffer and the bf16_rows_to_f32_kernel pass that the
+// previous SIMT FP32 path required.
+using CutlassElementA = cutlass::bfloat16_t;
+using CutlassElementB = cutlass::bfloat16_t;
+using CutlassElementC = float;
+using CutlassElementAccumulator = float;
+
+constexpr int kCutlassAlignA = 8;
+constexpr int kCutlassAlignB = 8;
 
 using CutlassGroupedConfig = cutlass::gemm::device::DefaultGemmConfiguration<
-    cutlass::arch::OpClassSimt,
+    cutlass::arch::OpClassTensorOp,
     cutlass::arch::Sm80,
-    float,
-    float,
-    float,
-    float>;
+    CutlassElementA,
+    CutlassElementB,
+    CutlassElementC,
+    CutlassElementAccumulator>;
 
 using CutlassGroupedKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
-    float,
+    CutlassElementA,
     cutlass::layout::RowMajor,
     cutlass::ComplexTransform::kNone,
-    1,
-    float,
+    kCutlassAlignA,
+    CutlassElementB,
     cutlass::layout::ColumnMajor,
     cutlass::ComplexTransform::kNone,
-    1,
-    float,
+    kCutlassAlignB,
+    CutlassElementC,
     cutlass::layout::RowMajor,
-    float,
-    cutlass::arch::OpClassSimt,
+    CutlassElementAccumulator,
+    cutlass::arch::OpClassTensorOp,
     cutlass::arch::Sm80,
     typename CutlassGroupedConfig::ThreadblockShape,
     typename CutlassGroupedConfig::WarpShape,
@@ -51,13 +67,13 @@ using CutlassGroupedStrideB = typename CutlassGroupedGemm::LayoutB::Stride::Long
 using CutlassGroupedStrideC = typename CutlassGroupedGemm::LayoutC::Stride::LongIndex;
 
 struct CutlassScratchView {
-    float* inter_f32;
-    float* w2_dequant;
+    // No more inter_f32 - hidden_states are already BF16.
+    CutlassElementB* w2_dequant;       // BF16 dequantized weights
     cutlass::gemm::GemmCoord* problem_sizes;
-    float** ptr_A;
-    float** ptr_B;
-    float** ptr_C;
-    float** ptr_D;
+    CutlassElementA** ptr_A;
+    CutlassElementB** ptr_B;
+    CutlassElementC** ptr_C;
+    CutlassElementC** ptr_D;
     CutlassGroupedStrideA* lda;
     CutlassGroupedStrideB* ldb;
     CutlassGroupedStrideC* ldc;
@@ -65,15 +81,15 @@ struct CutlassScratchView {
     void* gemm_workspace;
 };
 
-size_t cutlass_aux_bytes(int total_dispatched_tokens) {
+size_t cutlass_aux_bytes(int /*total_dispatched_tokens*/) {
     size_t total = 0;
-    total += align_up((size_t)total_dispatched_tokens * INTERMEDIATE_SIZE * sizeof(float));
-    total += align_up((size_t)kCutlassGroupedBatchExperts * HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(float));
+    // BF16 weight scratch (was FP32 before; halved).
+    total += align_up((size_t)kCutlassGroupedBatchExperts * HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(CutlassElementB));
     total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(cutlass::gemm::GemmCoord));
-    total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(float*));
-    total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(float*));
-    total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(float*));
-    total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(float*));
+    total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassElementA*));
+    total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassElementB*));
+    total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassElementC*));
+    total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassElementC*));
     total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassGroupedStrideA));
     total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassGroupedStrideB));
     total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassGroupedStrideC));
@@ -83,7 +99,7 @@ size_t cutlass_aux_bytes(int total_dispatched_tokens) {
 
 static CutlassScratchView bind_cutlass_scratch(void* storage,
                                                size_t storage_bytes,
-                                               int total_dispatched_tokens) {
+                                               int /*total_dispatched_tokens*/) {
     CutlassScratchView view{};
     if (!storage) {
         return view;
@@ -92,26 +108,23 @@ static CutlassScratchView bind_cutlass_scratch(void* storage,
     uintptr_t base = reinterpret_cast<uintptr_t>(storage);
     uintptr_t cursor = align_up(base);
 
-    view.inter_f32 = reinterpret_cast<float*>(cursor);
-    cursor += align_up((size_t)total_dispatched_tokens * INTERMEDIATE_SIZE * sizeof(float));
-
-    view.w2_dequant = reinterpret_cast<float*>(cursor);
-    cursor += align_up((size_t)kCutlassGroupedBatchExperts * HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(float));
+    view.w2_dequant = reinterpret_cast<CutlassElementB*>(cursor);
+    cursor += align_up((size_t)kCutlassGroupedBatchExperts * HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(CutlassElementB));
 
     view.problem_sizes = reinterpret_cast<cutlass::gemm::GemmCoord*>(cursor);
     cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(cutlass::gemm::GemmCoord));
 
-    view.ptr_A = reinterpret_cast<float**>(cursor);
-    cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(float*));
+    view.ptr_A = reinterpret_cast<CutlassElementA**>(cursor);
+    cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassElementA*));
 
-    view.ptr_B = reinterpret_cast<float**>(cursor);
-    cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(float*));
+    view.ptr_B = reinterpret_cast<CutlassElementB**>(cursor);
+    cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassElementB*));
 
-    view.ptr_C = reinterpret_cast<float**>(cursor);
-    cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(float*));
+    view.ptr_C = reinterpret_cast<CutlassElementC**>(cursor);
+    cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassElementC*));
 
-    view.ptr_D = reinterpret_cast<float**>(cursor);
-    cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(float*));
+    view.ptr_D = reinterpret_cast<CutlassElementC**>(cursor);
+    cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassElementC*));
 
     view.lda = reinterpret_cast<CutlassGroupedStrideA*>(cursor);
     cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassGroupedStrideA));
@@ -156,12 +169,12 @@ static cudaError_t cutlass_status_to_cuda_error(cutlass::Status status) {
     return cudaErrorUnknown;
 }
 
-static cudaError_t run_cutlass_grouped_float_gemm(
+static cudaError_t run_cutlass_grouped_bf16_gemm(
     CutlassScratchView const& scratch,
     std::vector<cutlass::gemm::GemmCoord> const& host_problem_sizes,
-    std::vector<float*> const& host_ptr_A,
-    std::vector<float*> const& host_ptr_B,
-    std::vector<float*> const& host_ptr_D,
+    std::vector<CutlassElementA*> const& host_ptr_A,
+    std::vector<CutlassElementB*> const& host_ptr_B,
+    std::vector<CutlassElementC*> const& host_ptr_D,
     std::vector<CutlassGroupedStrideA> const& host_lda,
     std::vector<CutlassGroupedStrideB> const& host_ldb,
     std::vector<CutlassGroupedStrideC> const& host_ldd,
@@ -171,8 +184,10 @@ static cudaError_t run_cutlass_grouped_float_gemm(
         return cudaSuccess;
     }
 
-    std::vector<float*> host_ptr_C = host_ptr_D;
-    std::vector<CutlassGroupedStrideC> host_ldc = host_ldd;
+    thread_local std::vector<CutlassElementC*> host_ptr_C;
+    thread_local std::vector<CutlassGroupedStrideC> host_ldc;
+    host_ptr_C.assign(host_ptr_D.begin(), host_ptr_D.end());
+    host_ldc.assign(host_ldd.begin(), host_ldd.end());
 
     K6_CUDA_CHECK(cudaMemcpyAsync(
         scratch.problem_sizes,
@@ -183,25 +198,25 @@ static cudaError_t run_cutlass_grouped_float_gemm(
     K6_CUDA_CHECK(cudaMemcpyAsync(
         scratch.ptr_A,
         host_ptr_A.data(),
-        problem_count * sizeof(float*),
+        problem_count * sizeof(CutlassElementA*),
         cudaMemcpyHostToDevice,
         stream));
     K6_CUDA_CHECK(cudaMemcpyAsync(
         scratch.ptr_B,
         host_ptr_B.data(),
-        problem_count * sizeof(float*),
+        problem_count * sizeof(CutlassElementB*),
         cudaMemcpyHostToDevice,
         stream));
     K6_CUDA_CHECK(cudaMemcpyAsync(
         scratch.ptr_C,
         host_ptr_C.data(),
-        problem_count * sizeof(float*),
+        problem_count * sizeof(CutlassElementC*),
         cudaMemcpyHostToDevice,
         stream));
     K6_CUDA_CHECK(cudaMemcpyAsync(
         scratch.ptr_D,
         host_ptr_D.data(),
-        problem_count * sizeof(float*),
+        problem_count * sizeof(CutlassElementC*),
         cudaMemcpyHostToDevice,
         stream));
     K6_CUDA_CHECK(cudaMemcpyAsync(
@@ -278,17 +293,23 @@ cudaError_t launch_cutlass_gemm2_combine(const Gemm2Problem& p,
         return cudaErrorInvalidValue;
     }
 
-    std::vector<int> host_offsets(NUM_LOCAL_EXPERTS + 1, 0);
-    K6_CUDA_CHECK(cudaMemcpy(host_offsets.data(),
-                             p.expert_token_offsets,
-                             host_offsets.size() * sizeof(int),
-                             cudaMemcpyDeviceToHost));
+    // Use the caller-provided host mirror when available so we skip the
+    // synchronous cudaMemcpy that would otherwise stall the launch pipeline.
+    int local_host_offsets[NUM_LOCAL_EXPERTS + 1];
+    const int* host_offsets = p.host_expert_token_offsets;
+    if (!host_offsets) {
+        K6_CUDA_CHECK(cudaMemcpy(local_host_offsets,
+                                 p.expert_token_offsets,
+                                 sizeof(local_host_offsets),
+                                 cudaMemcpyDeviceToHost));
+        host_offsets = local_host_offsets;
+    }
 
     CutlassScratchView scratch = bind_cutlass_scratch(
         workspace.cutlass_workspace,
         workspace.cutlass_workspace_bytes,
         total_tokens);
-    if (!scratch.inter_f32 || !scratch.w2_dequant ||
+    if (!scratch.w2_dequant ||
         !scratch.problem_sizes || !scratch.ptr_A || !scratch.ptr_B ||
         !scratch.ptr_C || !scratch.ptr_D || !scratch.lda || !scratch.ldb ||
         !scratch.ldc || !scratch.ldd) {
@@ -302,22 +323,22 @@ cudaError_t launch_cutlass_gemm2_combine(const Gemm2Problem& p,
         p.stream));
 
     constexpr int threads = 256;
-    int inter_total_all = total_tokens * INTERMEDIATE_SIZE;
-    bf16_rows_to_f32_kernel<<<(inter_total_all + threads - 1) / threads, threads, 0, p.stream>>>(
-        p.hidden_states,
-        0,
-        total_tokens,
-        INTERMEDIATE_SIZE,
-        scratch.inter_f32
-    );
-    K6_CUDA_CHECK(cudaGetLastError());
+
+    // hidden_states is already __nv_bfloat16 in expert-grouped order, so we
+    // can point ptr_A directly at it. No bf16->fp32 conversion pass needed.
+    CutlassElementA* a_base = reinterpret_cast<CutlassElementA*>(
+        const_cast<__nv_bfloat16*>(p.hidden_states));
 
     struct ActiveExpert {
         int expert;
         int begin;
         int token_count;
     };
-    std::vector<ActiveExpert> active_experts;
+    // thread_local: keep the heap allocation across calls. clear() preserves
+    // capacity, so after warm-up these never re-allocate.
+    thread_local std::vector<ActiveExpert> active_experts;
+    active_experts.clear();
+    active_experts.reserve(NUM_LOCAL_EXPERTS);
     for (int expert = 0; expert < NUM_LOCAL_EXPERTS; ++expert) {
         int begin = host_offsets[expert];
         int end = host_offsets[expert + 1];
@@ -326,13 +347,13 @@ cudaError_t launch_cutlass_gemm2_combine(const Gemm2Problem& p,
         }
     }
 
-    std::vector<cutlass::gemm::GemmCoord> problem_sizes;
-    std::vector<float*> ptr_A;
-    std::vector<float*> ptr_B;
-    std::vector<float*> ptr_D;
-    std::vector<CutlassGroupedStrideA> lda;
-    std::vector<CutlassGroupedStrideB> ldb;
-    std::vector<CutlassGroupedStrideC> ldd;
+    thread_local std::vector<cutlass::gemm::GemmCoord> problem_sizes;
+    thread_local std::vector<CutlassElementA*> ptr_A;
+    thread_local std::vector<CutlassElementB*> ptr_B;
+    thread_local std::vector<CutlassElementC*> ptr_D;
+    thread_local std::vector<CutlassGroupedStrideA> lda;
+    thread_local std::vector<CutlassGroupedStrideB> ldb;
+    thread_local std::vector<CutlassGroupedStrideC> ldd;
     problem_sizes.reserve(kCutlassGroupedBatchExperts);
     ptr_A.reserve(kCutlassGroupedBatchExperts);
     ptr_B.reserve(kCutlassGroupedBatchExperts);
@@ -359,16 +380,16 @@ cudaError_t launch_cutlass_gemm2_combine(const Gemm2Problem& p,
             const float* w2s_e = p.gemm2_weights_scale +
                 (size_t)info.expert * NUM_HIDDEN_BLOCKS * NUM_INTER_BLOCKS;
 
-            float* w2_slot = scratch.w2_dequant + i * (size_t)HIDDEN_SIZE * INTERMEDIATE_SIZE;
-            dequant_gemm2_weight_kernel<<<(gemm2_weight_total + threads - 1) / threads, threads, 0, p.stream>>>(
+            CutlassElementB* w2_slot = scratch.w2_dequant + i * (size_t)HIDDEN_SIZE * INTERMEDIATE_SIZE;
+            dequant_gemm2_weight_bf16_kernel<<<(gemm2_weight_total + threads - 1) / threads, threads, 0, p.stream>>>(
                 w2_e,
                 w2s_e,
-                w2_slot
+                reinterpret_cast<__nv_bfloat16*>(w2_slot)
             );
             K6_CUDA_CHECK(cudaGetLastError());
 
             problem_sizes.push_back({info.token_count, HIDDEN_SIZE, INTERMEDIATE_SIZE});
-            ptr_A.push_back(scratch.inter_f32 + (size_t)info.begin * INTERMEDIATE_SIZE);
+            ptr_A.push_back(a_base + (size_t)info.begin * INTERMEDIATE_SIZE);
             ptr_B.push_back(w2_slot);
             ptr_D.push_back(workspace.gemm2_output + (size_t)info.begin * HIDDEN_SIZE);
             lda.push_back(INTERMEDIATE_SIZE);
@@ -376,7 +397,7 @@ cudaError_t launch_cutlass_gemm2_combine(const Gemm2Problem& p,
             ldd.push_back(HIDDEN_SIZE);
         }
 
-        K6_CUDA_CHECK(run_cutlass_grouped_float_gemm(
+        K6_CUDA_CHECK(run_cutlass_grouped_bf16_gemm(
             scratch, problem_sizes, ptr_A, ptr_B, ptr_D, lda, ldb, ldd, p.stream));
     }
 

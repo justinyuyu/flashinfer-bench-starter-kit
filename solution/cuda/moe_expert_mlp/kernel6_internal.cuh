@@ -68,6 +68,7 @@ struct Gemm2Problem {
     const fp8_e4m3*      gemm2_weights;
     const float*         gemm2_weights_scale;
     const int*           expert_token_offsets;
+    const int*           host_expert_token_offsets = nullptr; // optional host mirror
     const int*           token_indices;
     const int*           local_expert_ids;
     const float*         token_expert_weights;
@@ -144,6 +145,11 @@ __global__ void dequant_gemm2_weight_kernel(
     const fp8_e4m3* __restrict__ weights,
     const float*    __restrict__ scales,
     float*          __restrict__ out);
+
+__global__ void dequant_gemm2_weight_bf16_kernel(
+    const fp8_e4m3* __restrict__ weights,
+    const float*    __restrict__ scales,
+    __nv_bfloat16*  __restrict__ out);
 
 size_t cutlass_aux_bytes(int total_dispatched_tokens);
 bool current_device_is_sm86_or_better();

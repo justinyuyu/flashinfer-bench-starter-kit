@@ -269,6 +269,24 @@ __global__ void dequant_gemm2_weight_kernel(
     float scale = scales[hb * NUM_INTER_BLOCKS + ib];
     out[idx] = fp8_to_float(weights[(size_t)row * INTERMEDIATE_SIZE + k]) * scale;
 }
+
+__global__ void dequant_gemm2_weight_bf16_kernel(
+    const fp8_e4m3* __restrict__ weights,
+    const float*    __restrict__ scales,
+    __nv_bfloat16*  __restrict__ out)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
+    if (idx >= total) return;
+
+    int row = idx / INTERMEDIATE_SIZE;
+    int k = idx % INTERMEDIATE_SIZE;
+    int hb = row / BLOCK_SIZE;
+    int ib = k / BLOCK_SIZE;
+    float scale = scales[hb * NUM_INTER_BLOCKS + ib];
+    out[idx] = __float2bfloat16(
+        fp8_to_float(weights[(size_t)row * INTERMEDIATE_SIZE + k]) * scale);
+}
 #endif
 
 }  // namespace kernel6_internal

@@ -117,11 +117,26 @@ __global__ void dequant_activations_kernel(
     int             seq_len,
     float*          __restrict__ out);
 
+__global__ void dequant_activations_bf16_kernel(
+    const fp8_e4m3* __restrict__ act,
+    const float*    __restrict__ act_scale,
+    const int*      __restrict__ token_indices,
+    int             token_offset,
+    int             token_count,
+    int             seq_len,
+    __nv_bfloat16*  __restrict__ out);
+
 __global__ void dequant_gemm1_weight_half_kernel(
     const fp8_e4m3* __restrict__ weights,
     const float*    __restrict__ scales,
     int             row_offset,
     float*          __restrict__ out);
+
+__global__ void dequant_gemm1_weight_half_bf16_kernel(
+    const fp8_e4m3* __restrict__ weights,
+    const float*    __restrict__ scales,
+    int             row_offset,
+    __nv_bfloat16*  __restrict__ out);
 
 __global__ void swiglu_pack_kernel(
     const float* __restrict__ up,

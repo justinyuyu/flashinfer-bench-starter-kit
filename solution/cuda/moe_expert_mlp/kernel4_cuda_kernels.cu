@@ -486,6 +486,49 @@ __global__ void dequant_gemm1_weight_half_kernel(
     out[idx] = fp8_to_float(weights[(size_t)global_row * HIDDEN_SIZE + k]) * scale;
 }
 
+__global__ void dequant_activations_bf16_kernel(
+    const fp8_e4m3* __restrict__ act,
+    const float*    __restrict__ act_scale,
+    const int*      __restrict__ token_indices,
+    int             token_offset,
+    int             token_count,
+    int             seq_len,
+    __nv_bfloat16*  __restrict__ out)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = token_count * HIDDEN_SIZE;
+    if (idx >= total) return;
+
+    int local_tok = idx / HIDDEN_SIZE;
+    int k = idx % HIDDEN_SIZE;
+    int global_tok = token_offset + local_tok;
+    int orig_tok = token_indices[global_tok];
+    int bk = k / BLOCK_SIZE;
+    float scale = act_scale[bk * seq_len + orig_tok];
+    out[idx] = __float2bfloat16(
+        fp8_to_float(act[(size_t)global_tok * HIDDEN_SIZE + k]) * scale);
+}
+
+__global__ void dequant_gemm1_weight_half_bf16_kernel(
+    const fp8_e4m3* __restrict__ weights,
+    const float*    __restrict__ scales,
+    int             row_offset,
+    __nv_bfloat16*  __restrict__ out)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = INTERMEDIATE_SIZE * HIDDEN_SIZE;
+    if (idx >= total) return;
+
+    int row = idx / HIDDEN_SIZE;
+    int k = idx % HIDDEN_SIZE;
+    int global_row = row_offset + row;
+    int bn = global_row / BLOCK_SIZE;
+    int bk = k / BLOCK_SIZE;
+    float scale = scales[bn * NUM_HIDDEN_BLOCKS + bk];
+    out[idx] = __float2bfloat16(
+        fp8_to_float(weights[(size_t)global_row * HIDDEN_SIZE + k]) * scale);
+}
+
 __global__ void swiglu_pack_kernel(
     const float* __restrict__ up,
     const float* __restrict__ gate,

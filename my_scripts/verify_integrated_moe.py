@@ -341,9 +341,17 @@ def analyze_dispatch(
     active_experts = int(torch.count_nonzero(local_counts).item())
     cutlass_enabled = cutlass_enabled_for_current_device()
 
-    if total_tok <= 256 or seq_len <= 32:
+    # Mirror choose_kernel4_backend_policy() in solution/cuda/moe_ffi.cu.
+    # The integrated path always passes has_local_expert_ids=true.
+    if 1 <= total_tok <= 4:
+        k4_backend = "cutlass" if cutlass_enabled else "tiled"
+    elif total_tok <= 4:
+        k4_backend = "tiled"
+    elif cutlass_enabled and 18 <= total_tok <= 256:
+        k4_backend = "cutlass"
+    elif total_tok <= 256 or seq_len <= 32:
         k4_backend = "fallback"
-    elif cutlass_enabled and (total_tok >= 768 or seq_len >= 1024):
+    elif cutlass_enabled and (total_tok >= 320 or seq_len >= 384):
         k4_backend = "cutlass"
     elif total_tok <= 4096 or seq_len <= 512:
         k4_backend = "tiled"

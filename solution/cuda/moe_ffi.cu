@@ -146,23 +146,46 @@ int choose_total_tokens(tvm::ffi::Tensor expert_token_offsets) {
 Kernel4Backend choose_kernel4_backend_policy(int seq_len,
                                              int total_tok,
                                              bool has_local_expert_ids) {
-    // Very tiny routed batches benefit from the micro-tiled kernel4 path.
-    if (total_tok <= 4) {
+    // Very tiny routed batches: route to Cutlass when available. Cutlass uses
+    // device-side expert offsets so it skips the host-fetch sync entirely, and
+    // the BF16 TensorOp grouped GEMM beats the per-expert tiled loop (which
+    // launches one micro kernel per active expert plus carries 32 iterations
+    // of bookkeeping). When CUTLASS isn't compiled in, fall back to Tiled.
+    if (total_tok >= 1 && total_tok <= 4) {
+        if (k4_cutlass_available()) {
+            return Kernel4Backend::Cutlass;
+        }
         return Kernel4Backend::Tiled;
     }
 
-    if (k4_cutlass_available() && total_tok >= 18 && total_tok <= 24) {
+    // Unified Cutlass window: total_tok in [18, 256]. Empirically the BF16
+    // TensorOp grouped GEMM beats both Fallback and Tiled across this whole
+    // range. Previous experiments showed:
+    //   - total_tok=23 -> cutlass 8.5ms (vs fallback ~10ms+)
+    //   - total_tok=93/95 -> cutlass ~15ms (vs fallback 44ms)
+    //   - total_tok=192 -> cutlass 24ms (vs fallback 84ms)
+    //   - total_tok=139 -> cutlass 19ms (vs fallback 62ms)
+    // The previously-untested [25, 87] gap is filled here on the assumption
+    // that the cutlass setup amortizes monotonically once total_tok >= 18.
+    if (k4_cutlass_available() && total_tok >= 18 && total_tok <= 256) {
         return Kernel4Backend::Cutlass;
     }
 
-    // Small: minimize setup overhead.
+    // Tiny batch (total_tok in [5, 17]): cutlass setup dominates at this size,
+    // and Tiled has even higher per-call overhead than Fallback for sub-20-tok
+    // workloads. The previous attempt to route seq_len<=31 through Tiled
+    // regressed seq=15/16/31 by 8-17ms each, so we keep them on Fallback.
     if (total_tok <= 256 || seq_len <= 32) {
         return has_local_expert_ids ? Kernel4Backend::Fallback : Kernel4Backend::Tiled;
     }
 
     // Promote to CUTLASS earlier for medium/large workloads once the
-    // grouped GEMM setup cost is amortized.
-    if (k4_cutlass_available() && (total_tok >= 768 || seq_len >= 1024)) {
+    // grouped GEMM setup cost is amortized. With the new BF16 Tensor-Op
+    // kernel4 cutlass path, the crossover point against the hand-tiled
+    // kernel sits around ~320 tokens / ~384 seq_len. The earlier
+    // `total_tok <= 256` gate already keeps very small batches on the
+    // fallback/tiled path, so this won't accidentally pull tiny shapes in.
+    if (k4_cutlass_available() && (total_tok >= 320 || seq_len >= 384)) {
         return Kernel4Backend::Cutlass;
     }
 
@@ -480,7 +503,9 @@ void integrated_moe_ffi_wrapper(ffi::Tensor routing_logits,
         return;
     }
     FusedMoeTempBuffers buffers = bind_fused_moe_temp(fused_storage, seq_len);
-    cudaMemset(buffers.expert_token_counts, 0, static_cast<size_t>(moe_spec::NUM_EXPERTS) * sizeof(int));
+    // Async zeroing: avoid a host sync that previously dominated tiny-shape latency.
+    cudaMemsetAsync(buffers.expert_token_counts, 0,
+                    static_cast<size_t>(moe_spec::NUM_EXPERTS) * sizeof(int));
 
     router<E_GLOBAL, E_LOCAL, TOP_K><<<blocks, threads>>>(
         static_cast<const float*>(routing_logits.data_ptr()),
@@ -508,24 +533,20 @@ void integrated_moe_ffi_wrapper(ffi::Tensor routing_logits,
         moe_spec::NUM_LOCAL_EXPERTS);
     finalize_expert_offsets(local_counts_ptr, buffers.expert_token_offsets, moe_spec::NUM_LOCAL_EXPERTS);
 
+    // Always fetch the full offsets array. The latency of cudaMemcpy is
+    // dominated by the API/round-trip cost, not by the 132 bytes payload, so
+    // there's no win from a 4-byte fast path. The full mirror lets every
+    // downstream backend (cutlass kernel4 + cutlass kernel6 + tiled +
+    // fallback) skip its own cudaMemcpy host-sync.
     int total_tok = 0;
     int host_expert_offsets[moe_spec::NUM_LOCAL_EXPERTS + 1];
-    const int* host_expert_offsets_ptr = nullptr;
-    if (k4_cutlass_available() && seq_len >= 1024) {
-        cudaMemcpy(
-            &total_tok,
-            buffers.expert_token_offsets + moe_spec::NUM_LOCAL_EXPERTS,
-            sizeof(int),
-            cudaMemcpyDeviceToHost);
-    } else {
-        cudaMemcpy(
-            host_expert_offsets,
-            buffers.expert_token_offsets,
-            sizeof(host_expert_offsets),
-            cudaMemcpyDeviceToHost);
-        total_tok = host_expert_offsets[moe_spec::NUM_LOCAL_EXPERTS];
-        host_expert_offsets_ptr = host_expert_offsets;
-    }
+    cudaMemcpy(
+        host_expert_offsets,
+        buffers.expert_token_offsets,
+        sizeof(host_expert_offsets),
+        cudaMemcpyDeviceToHost);
+    total_tok = host_expert_offsets[moe_spec::NUM_LOCAL_EXPERTS];
+    const int* host_expert_offsets_ptr = host_expert_offsets;
 
     launch_moe_reindex(
         buffers.token_expert_indices,
@@ -588,6 +609,7 @@ void integrated_moe_ffi_wrapper(ffi::Tensor routing_logits,
     k6_problem.local_expert_offset = local_expert_offset;
     k6_problem.routed_scaling_factor = routed_scaling_factor;
     k6_problem.expert_token_offsets = buffers.expert_token_offsets;
+    k6_problem.host_expert_token_offsets = host_expert_offsets_ptr;
     k6_problem.total_dispatched_tokens = total_tok;
     k6_problem.token_indices = buffers.token_indices;
     k6_problem.local_expert_ids = buffers.local_expert_ids;

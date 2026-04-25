@@ -120,6 +120,7 @@ cudaError_t k6_launch(const Kernel6Problem& p,
     shared_problem.gemm2_weights = p.gemm2_weights;
     shared_problem.gemm2_weights_scale = p.gemm2_weights_scale;
     shared_problem.expert_token_offsets = p.expert_token_offsets;
+    shared_problem.host_expert_token_offsets = p.host_expert_token_offsets;
     shared_problem.token_indices = p.token_indices;
     shared_problem.local_expert_ids = p.local_expert_ids;
     shared_problem.token_expert_weights = p.token_expert_weights;
